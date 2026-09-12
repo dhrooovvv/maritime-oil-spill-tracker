@@ -1,0 +1,6 @@
+__pycache__/
+*.tmp
+.streamlit/
+models/*.pth
+.venv/
+.DS_Store

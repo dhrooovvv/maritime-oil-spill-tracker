@@ -1,0 +1,11 @@
+streamlit
+rasterio
+opencv-python
+numpy
+pandas
+xarray
+netCDF4
+matplotlib
+torch
+torchvision
+

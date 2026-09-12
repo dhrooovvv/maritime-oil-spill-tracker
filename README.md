@@ -1,0 +1,90 @@
+# 🌊 Maritime Oil Spill Detection & Vessel Tracking System
+
+An end-to-end GIS maritime intelligence platform built for the **Smart India Hackathon (SIH)**. 
+
+It parses Sentinel-1 SAR satellite GeoTIFF files, models hydrodynamic oil slick dispersion using NetCDF oceanographic data, and performs spatial proximity matches against Marine Cadastre AIS vessel logs.
+
+---
+
+## 🛠️ Tech Stack & Architecture
+- **Language & UI:** Python, Streamlit
+- **GIS & Satellite Parsing:** `rasterio`, OpenCV
+- **Optional Candidate Classification:** PyTorch, torchvision, EfficientNetB0
+- **Hydrodynamic Modeling:** `xarray`, NetCDF4, Matplotlib
+- **Vessel Tracking:** `pandas` (Marine Cadastre AIS Format)
+
+---
+
+## 🚀 Key Modules
+1. **GeoTIFF Spatial Extraction:** Reads native `.tif` map headers (CRS, UTM bounds) and isolates oil slick center pixels using computer vision thresholding.
+2. **Hydrodynamic Drift Engine:** Parses $u, v$ ocean current and surface wind vector arrays from `.nc` weather files to model Lagrangian particle dispersion over a 48-hour timeline.
+3. **Marine Cadastre AIS Matcher:** Runs Euclidean spatial proximity queries against historical vessel logs to isolate high-risk suspect vessels near the spill origin.
+
+## Phase 2: Optional Candidate Classification
+
+Tab 1 uses OpenCV to generate and rank dark SAR candidates first. The optional
+EfficientNetB0 stage then classifies each retained crop as either:
+
+- `Look-alike` (class 0)
+- `Oil-like` (class 1)
+
+The Streamlit app does not train a model and does not download ImageNet weights
+for inference. It loads only a locally supplied, fine-tuned checkpoint at:
+
+```text
+models/efficientnet_b0_oil_classifier.pth
+```
+
+If that file is absent, or PyTorch/torchvision is unavailable, classical
+candidate detection and spill characterization continue to work and AI
+classification is shown as unavailable.
+
+The repository currently contains no labelled classifier dataset and no trained
+oil-spill weights. A suitable dataset layout is:
+
+```text
+data/
+└── classifier/
+    ├── train/
+    │   ├── look_alike/
+    │   └── oil/
+    └── val/
+        ├── look_alike/
+        └── oil/
+```
+
+After supplying representative labelled SAR candidate crops, train separately
+from the project root:
+
+```bash
+python detection/train_classifier.py
+```
+
+The training script reports validation accuracy, oil-class precision, recall,
+F1, and a confusion matrix, then saves the best checkpoint under `models/`.
+It supports CUDA, Apple MPS, and CPU fallback. Training metrics are not
+meaningful until real labelled data has been supplied.
+
+---
+
+## 💻 How to Run Locally
+
+```bash
+# 1. Clone repository
+git clone [https://github.com/YOUR_USERNAME/maritime-oil-spill-tracker.git](https://github.com/YOUR_USERNAME/maritime-oil-spill-tracker.git)
+cd maritime-oil-spill-tracker
+
+# 2. Install dependencies, including the optional EfficientNet stack
+pip install -r requirements.txt
+
+# 3. Generate mock spatial databases
+python generate_metocean.py
+python generate_ais.py
+
+# 4. Launch Streamlit Dashboard
+streamlit run app.py
+```
+
+EfficientNet output is a model score, not a scientifically validated oil
+probability. Reliable oil-spill classification requires fine-tuning and
+validation on representative SAR oil/look-alike data.
