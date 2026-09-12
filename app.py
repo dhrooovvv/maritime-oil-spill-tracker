@@ -1,5 +1,6 @@
 import os
 import tempfile
+import math
 from pathlib import Path
 
 import cv2
@@ -8,11 +9,18 @@ import pandas as pd
 import rasterio
 import streamlit as st
 import xarray as xr
+from rasterio.warp import transform as transform_coordinates
 
 from detection.classifier import (
     ClassifierLoadError,
     EfficientNetOilClassifier,
     runtime_status,
+)
+from tracking.vessel_matcher import (
+    VesselMatcherError,
+    find_closest_vessel,
+    load_ais_data,
+    rank_vessels,
 )
 
 
@@ -26,6 +34,223 @@ def load_oil_spill_classifier(weights_path):
     """Load the fine-tuned classifier once per Streamlit process."""
 
     return EfficientNetOilClassifier.from_weights(weights_path)
+
+
+EARTH_RADIUS_METERS = 6_371_000.0
+
+
+def calculate_direction(east_m, north_m):
+    """Return a compass direction from east/north displacement components."""
+
+    if math.isclose(east_m, 0.0, abs_tol=1e-9) and math.isclose(
+        north_m, 0.0, abs_tol=1e-9
+    ):
+        return "Stationary"
+
+    angle_from_north = (math.degrees(math.atan2(east_m, north_m)) + 360) % 360
+    directions = ("N", "NE", "E", "SE", "S", "SW", "W", "NW")
+    return directions[int((angle_from_north + 22.5) // 45) % 8]
+
+
+def format_geo_coordinate(value, positive_suffix, negative_suffix):
+    """Format a geographic coordinate with a readable hemisphere suffix."""
+
+    suffix = positive_suffix if value >= 0 else negative_suffix
+    return f"{abs(value):.4f}° {suffix}"
+
+
+def _fill_temporal_values(values, variable_name):
+    """Fill limited temporal gaps without allowing NaNs into the forecast."""
+
+    values = np.asarray(values, dtype=float)
+    valid = np.isfinite(values)
+    if not valid.any():
+        raise ValueError(f"NetCDF variable '{variable_name}' contains no valid values.")
+    if valid.all():
+        return values
+
+    valid_indices = np.flatnonzero(valid)
+    if len(valid_indices) == 1:
+        return np.full(values.shape, values[valid_indices[0]], dtype=float)
+    return np.interp(
+        np.arange(len(values), dtype=float),
+        valid_indices.astype(float),
+        values[valid],
+    )
+
+
+def build_environmental_forcing(dataset, hours):
+    """Prepare hourly current/wind forcing for the prototype trajectory.
+
+    Spatial dimensions are averaged because this prototype does not yet perform
+    spatial interpolation. If the NetCDF time series is static, a small smooth
+    rotation of the existing combined vector is used and labelled as synthetic.
+    """
+
+    required_variables = ("u_current", "v_current", "u_wind", "v_wind")
+    missing_variables = [
+        name for name in required_variables if name not in dataset.data_vars
+    ]
+    if missing_variables:
+        missing = ", ".join(missing_variables)
+        raise ValueError(f"NetCDF is missing expected variable(s): {missing}.")
+
+    time_size = int(dataset.sizes.get("time", 1))
+    temporal_series = {}
+    for variable_name in required_variables:
+        data_array = dataset[variable_name]
+        if "time" in data_array.dims:
+            spatial_dimensions = [
+                dimension for dimension in data_array.dims if dimension != "time"
+            ]
+            if spatial_dimensions:
+                data_array = data_array.mean(dim=spatial_dimensions, skipna=True)
+            values = np.asarray(data_array.values, dtype=float).reshape(-1)
+        else:
+            scalar_value = float(data_array.mean(skipna=True).values)
+            values = np.full(time_size, scalar_value, dtype=float)
+
+        if len(values) != time_size:
+            values = np.full(time_size, float(np.nanmean(values)), dtype=float)
+        temporal_series[variable_name] = _fill_temporal_values(
+            values, variable_name
+        )
+
+    temporal_change = any(
+        np.ptp(values) > 1e-9 for values in temporal_series.values()
+    )
+    if "time" in dataset.dims and time_size > 1 and temporal_change:
+        source_hours = np.arange(time_size, dtype=float)
+        target_hours = np.arange(hours, dtype=float)
+        forcing = {
+            variable_name: np.interp(
+                target_hours,
+                source_hours,
+                values,
+            )
+            for variable_name, values in temporal_series.items()
+        }
+        mode = "NetCDF time-varying forcing"
+        synthetic_variation = False
+    else:
+        initial_values = {
+            variable_name: float(values[0])
+            for variable_name, values in temporal_series.items()
+        }
+        forcing = {
+            variable_name: np.full(hours, value, dtype=float)
+            for variable_name, value in initial_values.items()
+        }
+
+        # The supplied dataset has a time dimension, but identical values at
+        # every time slice. Keep the speed based on those values and apply only
+        # a small smooth directional change for this demonstration.
+        base_net_u = initial_values["u_current"] + 0.03 * initial_values["u_wind"]
+        base_net_v = initial_values["v_current"] + 0.03 * initial_values["v_wind"]
+        for hour in range(hours):
+            rotation = math.radians(8.0) * math.sin(2.0 * math.pi * hour / 48.0)
+            cosine = math.cos(rotation)
+            sine = math.sin(rotation)
+            forcing_net_u = base_net_u * cosine - base_net_v * sine
+            forcing_net_v = base_net_u * sine + base_net_v * cosine
+            forcing.setdefault("net_u", np.zeros(hours, dtype=float))[hour] = (
+                forcing_net_u
+            )
+            forcing.setdefault("net_v", np.zeros(hours, dtype=float))[hour] = (
+                forcing_net_v
+            )
+        mode = "Prototype Environmental Variation"
+        synthetic_variation = True
+
+    if not synthetic_variation:
+        forcing["net_u"] = forcing["u_current"] + 0.03 * forcing["u_wind"]
+        forcing["net_v"] = forcing["v_current"] + 0.03 * forcing["v_wind"]
+
+    for component_name in ("net_u", "net_v"):
+        if not np.isfinite(forcing[component_name]).all():
+            raise ValueError("Environmental forcing contains invalid values.")
+
+    return {
+        "forcing": forcing,
+        "mode": mode,
+        "synthetic_variation": synthetic_variation,
+    }
+
+
+def build_drift_trajectory(
+    hours,
+    net_u,
+    net_v,
+    origin_x,
+    origin_y,
+    crs,
+    forcing_u=None,
+    forcing_v=None,
+):
+    """Build cumulative physical displacement and display coordinates."""
+
+    crs_obj = rasterio.crs.CRS.from_user_input(crs)
+    is_geographic = crs_obj.is_geographic
+    is_metric_projected = crs_obj.is_projected and getattr(
+        crs_obj, "linear_units", None
+    ) in ("metre", "meter", "m")
+
+    if not is_geographic and not is_metric_projected:
+        raise ValueError(
+            "Tab 2 supports geographic CRS or projected CRS with metre units "
+            "for displacement conversion."
+        )
+
+    if forcing_u is None:
+        forcing_u = np.full(hours, net_u, dtype=float)
+    if forcing_v is None:
+        forcing_v = np.full(hours, net_v, dtype=float)
+    if len(forcing_u) < hours or len(forcing_v) < hours:
+        raise ValueError("Environmental forcing does not cover the forecast duration.")
+
+    east_displacement_m = 0.0
+    north_displacement_m = 0.0
+    trajectory = []
+    origin_latitude_radians = math.radians(origin_y)
+    for hour in range(hours + 1):
+        if hour > 0:
+            timestep_seconds = 3600.0
+            east_displacement_m += float(forcing_u[hour - 1]) * timestep_seconds
+            north_displacement_m += float(forcing_v[hour - 1]) * timestep_seconds
+        total_drift_m = math.hypot(east_displacement_m, north_displacement_m)
+
+        if is_geographic:
+            latitude = origin_y + math.degrees(
+                north_displacement_m / EARTH_RADIUS_METERS
+            )
+            longitude = origin_x + math.degrees(
+                east_displacement_m
+                / (EARTH_RADIUS_METERS * math.cos(origin_latitude_radians))
+            )
+        else:
+            projected_x = origin_x + east_displacement_m
+            projected_y = origin_y + north_displacement_m
+            longitude_values, latitude_values = transform_coordinates(
+                crs_obj,
+                "EPSG:4326",
+                [projected_x],
+                [projected_y],
+            )
+            longitude = longitude_values[0]
+            latitude = latitude_values[0]
+
+        trajectory.append(
+            {
+                "Hour": hour,
+                "East_Drift_km": east_displacement_m / 1000.0,
+                "North_Drift_km": north_displacement_m / 1000.0,
+                "Total_Drift_km": total_drift_m / 1000.0,
+                "Latitude": latitude,
+                "Longitude": longitude,
+            }
+        )
+
+    return pd.DataFrame(trajectory)
 
 st.set_page_config(page_title="Oil Spill Tracker", page_icon="🌊", layout="wide")
 
@@ -760,113 +985,147 @@ with tab1:
 import matplotlib.pyplot as plt
 
 with tab2:
-    st.subheader("2. Hydrodynamic Drift Prediction (INCOIS / ERA5 NetCDF Engine)")
+    st.subheader("2. Spill Drift Simulation")
 
-    if "real_x" in st.session_state:
-        rx = st.session_state["real_x"]
-        ry = st.session_state["real_y"]
-
-        st.info(
-            f"📍 **Spill Origin:** X = {rx:.2f}, Y = {ry:.2f} ({st.session_state['crs']})"
-        )
+    if "real_x" in st.session_state and "real_y" in st.session_state:
+        rx = float(st.session_state["real_x"])
+        ry = float(st.session_state["real_y"])
+        spill_crs = st.session_state.get("crs", "CRS unavailable")
 
         try:
-            # Read NetCDF ocean forces using xarray
+            spill_crs_obj = rasterio.crs.CRS.from_user_input(spill_crs)
+            geographic_origin = spill_crs_obj.is_geographic
+        except Exception as exc:
+            st.error(f"The spill CRS could not be interpreted: {exc}")
+            geographic_origin = False
+            spill_crs_obj = None
+
+        try:
             ds = xr.open_dataset("ocean_currents.nc")
 
-            # Extract velocity vectors at origin
-            u_c = float(ds["u_current"].mean())  # m/s (Eastward current)
-            v_c = float(ds["v_current"].mean())  # m/s (Northward current)
-            u_w = float(ds["u_wind"].mean())  # m/s (Eastward wind)
-            v_w = float(ds["v_wind"].mean())  # m/s (Northward wind)
+            st.markdown("### ⏱️ Forecast Timeline")
+            hours = st.slider("Forecast duration (hours)", 1, 48, 24)
+            st.write(f"**Selected forecast:** {hours} hours")
 
-            # Display key vector metrics
-            col1, col2, col3 = st.columns(3)
-            with col1:
+            environmental_result = build_environmental_forcing(ds, hours)
+            environmental_forcing = environmental_result["forcing"]
+            forcing_mode = environmental_result["mode"]
+            synthetic_variation = environmental_result["synthetic_variation"]
+            u_c = float(environmental_forcing["u_current"][0])
+            v_c = float(environmental_forcing["v_current"][0])
+            u_w = float(environmental_forcing["u_wind"][0])
+            v_w = float(environmental_forcing["v_wind"][0])
+            net_u = float(environmental_forcing["net_u"][0])
+            net_v = float(environmental_forcing["net_v"][0])
+            average_drift_speed = float(
+                np.mean(
+                    np.hypot(
+                        environmental_forcing["net_u"],
+                        environmental_forcing["net_v"],
+                    )
+                )
+            )
+
+            st.markdown("### 📍 Spill Origin")
+            origin_col1, origin_col2, origin_col3 = st.columns(3)
+            with origin_col1:
+                if geographic_origin:
+                    st.metric("Longitude", format_geo_coordinate(rx, "E", "W"))
+                else:
+                    origin_units = getattr(spill_crs_obj, "linear_units", "map units")
+                    st.metric("X / Easting", f"{rx:,.2f} {origin_units}")
+            with origin_col2:
+                if geographic_origin:
+                    st.metric("Latitude", format_geo_coordinate(ry, "N", "S"))
+                else:
+                    origin_units = getattr(spill_crs_obj, "linear_units", "map units")
+                    st.metric("Y / Northing", f"{ry:,.2f} {origin_units}")
+            with origin_col3:
+                st.metric("CRS", str(spill_crs))
+
+            st.markdown("### 🌊 Environmental Conditions")
+            metric_col1, metric_col2, metric_col3 = st.columns(3)
+            with metric_col1:
                 st.metric(
-                    "🌊 Ocean Current (u, v)", f"{u_c:.2f} m/s E, {v_c:.2f} m/s N"
+                    "🌊 Initial Ocean Current",
+                    f"{u_c:.2f} m/s E | {v_c:.2f} m/s N",
                 )
-            with col2:
+            with metric_col2:
                 st.metric(
-                    "💨 Surface Wind (u, v)", f"{u_w:.1f} m/s E, {v_w:.1f} m/s N"
+                    "💨 Initial Surface Wind",
+                    f"{u_w:.1f} m/s E | {v_w:.1f} m/s N",
                 )
-            with col3:
-                # Combined drift velocity = Current + 3% Wind factor
-                net_u = u_c + (0.03 * u_w)
-                net_v = v_c + (0.03 * v_w)
-                net_speed = np.sqrt(net_u**2 + net_v**2)
-                st.metric("⚡ Combined Drift Speed", f"{net_speed:.2f} m/s")
+            with metric_col3:
+                net_speed = math.hypot(net_u, net_v)
+                st.metric("⚡ Initial Combined Drift Speed", f"{net_speed:.2f} m/s")
+            st.caption(
+                "Prototype assumption: combined drift = ocean current + 3% of wind. "
+                f"Forcing mode: {forcing_mode}."
+            )
 
-            st.markdown("---")
+            trajectory_df = build_drift_trajectory(
+                hours,
+                net_u,
+                net_v,
+                rx,
+                ry,
+                spill_crs,
+                forcing_u=environmental_forcing["net_u"],
+                forcing_v=environmental_forcing["net_v"],
+            )
+            final_point = trajectory_df.iloc[-1]
+            total_drift_km = float(final_point["Total_Drift_km"])
+            direction = calculate_direction(
+                float(final_point["East_Drift_km"]),
+                float(final_point["North_Drift_km"]),
+            )
 
-            # Interactive forecast timeline slider
-            hours = st.slider("⏱️ Forecast Timeline (Hours)", 1, 48, 24)
+            st.markdown(f"### 📊 {hours}-Hour Forecast")
+            summary_col1, summary_col2, summary_col3 = st.columns(3)
+            with summary_col1:
+                st.metric("Predicted Movement", f"{total_drift_km:.1f} km")
+            with summary_col2:
+                st.metric("Direction", direction)
+            with summary_col3:
+                st.metric("Average Drift Speed", f"{average_drift_speed:.2f} m/s")
 
-            # Calculate Lagrangian Particle Displacement
-            trajectory = []
-            for h in range(hours + 1):
-                seconds = h * 3600
-                dx = net_u * seconds
-                dy = net_v * seconds
+            st.info(
+                f"🌊 Predicted spill movement: {total_drift_km:.1f} km over {hours} hours."
+            )
 
-                trajectory.append(
-                    {
-                        "Hour": h,
-                        "Predicted_X": rx + dx,
-                        "Predicted_Y": ry + dy,
-                        "Drift_Distance_km": np.sqrt(dx**2 + dy**2) / 1000.0,
-                    }
-                )
-
-            traj_df = pd.DataFrame(trajectory)
-
-            # --- VISUALIZATION BLOCK ---
             col_left, col_right = st.columns([3, 2])
-
             with col_left:
-                st.markdown("### 🗺️ 2D Spatial Particle Drift Path")
-
-                # Create Matplotlib Plot for Vector Trajectory
+                st.markdown("### 🗺️ Predicted Spill Movement")
                 fig, ax = plt.subplots(figsize=(7, 5))
                 fig.patch.set_facecolor("#0e1117")
                 ax.set_facecolor("#161b22")
-
-                # Plot path line
                 ax.plot(
-                    traj_df["Predicted_X"],
-                    traj_df["Predicted_Y"],
+                    trajectory_df["East_Drift_km"],
+                    trajectory_df["North_Drift_km"],
                     color="#00d4ff",
-                    linestyle="--",
+                    linestyle="-",
                     linewidth=2,
-                    label="Drift Trajectory",
+                    label="Spill Movement",
                 )
-
-                # Mark Origin Point
                 ax.scatter(
-                    rx,
-                    ry,
+                    0,
+                    0,
                     color="#ff4b4b",
                     s=120,
                     zorder=5,
-                    label="Spill Origin (0h)",
+                    label="Spill Start",
                 )
-
-                # Mark Projected Endpoint
-                end_x = traj_df.iloc[-1]["Predicted_X"]
-                end_y = traj_df.iloc[-1]["Predicted_Y"]
                 ax.scatter(
-                    end_x,
-                    end_y,
+                    final_point["East_Drift_km"],
+                    final_point["North_Drift_km"],
                     color="#ffaa00",
                     s=120,
                     zorder=5,
-                    label=f"Predicted ({hours}h)",
+                    label="Predicted Position",
                 )
-
-                # Annotate End Point
                 ax.annotate(
-                    f"+{hours}h ({traj_df.iloc[-1]['Drift_Distance_km']:.1f} km)",
-                    (end_x, end_y),
+                    f"+{hours}h — {total_drift_km:.1f} km",
+                    (final_point["East_Drift_km"], final_point["North_Drift_km"]),
                     textcoords="offset points",
                     xytext=(10, 10),
                     ha="left",
@@ -874,79 +1133,219 @@ with tab2:
                     fontsize=9,
                     weight="bold",
                 )
-
-                # Styling
-                ax.set_xlabel("Spatial X (UTM Easting)", color="white")
-                ax.set_ylabel("Spatial Y (UTM Northing)", color="white")
+                ax.set_xlabel("Distance East (km)", color="white")
+                ax.set_ylabel("Distance North (km)", color="white")
                 ax.tick_params(colors="white")
+                ax.margins(0.15)
                 for spine in ax.spines.values():
                     spine.set_color("#30363d")
                 ax.grid(True, linestyle=":", color="#30363d", alpha=0.6)
                 ax.legend(
-                    facecolor="#0e1117", edgecolor="#30363d", labelcolor="white"
+                    facecolor="#0e1117",
+                    edgecolor="#30363d",
+                    labelcolor="white",
                 )
-
                 st.pyplot(fig)
 
             with col_right:
-                st.markdown("### 📊 Forecast Data")
-
-                # Summary Callout
-                total_drift = traj_df.iloc[-1]["Drift_Distance_km"]
-                st.warning(
-                    f"⚠️ **Slick Dispersion:** Predicted to travel **{total_drift:.2f} km** over **{hours} hours**."
+                st.markdown("### 📍 Forecast Checkpoints")
+                checkpoint_hours = [
+                    checkpoint for checkpoint in (0, 6, 12, 24, 36, 48)
+                    if checkpoint <= hours
+                ]
+                if hours not in checkpoint_hours:
+                    checkpoint_hours.append(hours)
+                    checkpoint_hours.sort()
+                checkpoint_df = trajectory_df[
+                    trajectory_df["Hour"].isin(checkpoint_hours)
+                ][["Hour", "East_Drift_km", "North_Drift_km", "Total_Drift_km"]].rename(
+                    columns={
+                        "East_Drift_km": "East (km)",
+                        "North_Drift_km": "North (km)",
+                        "Total_Drift_km": "Total Movement (km)",
+                    }
                 )
-
-                # Display compact table
                 st.dataframe(
-                    traj_df[["Hour", "Predicted_X", "Predicted_Y", "Drift_Distance_km"]].rename(
-                        columns={"Drift_Distance_km": "Drift (km)"}
-                    ),
-                    height=320,
+                    checkpoint_df.round(2),
+                    hide_index=True,
                     use_container_width=True,
                 )
+
+            with st.expander("Detailed Forecast Data"):
+                detailed_df = trajectory_df.rename(
+                    columns={
+                        "East_Drift_km": "East Drift (km)",
+                        "North_Drift_km": "North Drift (km)",
+                        "Total_Drift_km": "Total Drift (km)",
+                    }
+                )
+                st.dataframe(
+                    detailed_df.round(6),
+                    height=320,
+                    hide_index=True,
+                    use_container_width=True,
+                )
+
+            st.info(
+                "Prototype simulation using current and wind inputs from the supplied "
+                "NetCDF dataset. This is not an operational hydrodynamic forecast."
+                + (
+                    " Temporal environmental variation is simulated for prototype demonstration."
+                    if synthetic_variation
+                    else ""
+                )
+            )
 
         except FileNotFoundError:
             st.error(
                 "Missing 'ocean_currents.nc'. Run `python generate_metocean.py` first!"
             )
-
+        except (KeyError, ValueError, rasterio.errors.RasterioError) as exc:
+            st.error(f"Tab 2 could not build the drift forecast: {exc}")
     else:
         st.warning("Please upload a `.tif` file in Tab 1 first.")
 
 with tab3:
-    st.subheader("3. Vessel Tracking (Marine Cadastre AIS Spatial Match)")
-    if 'real_x' in st.session_state:
-        rx = st.session_state['real_x']
-        ry = st.session_state['real_y']
+    st.subheader("3. Vessel Tracking & Suspect Matching")
+    st.info(
+        "⚠️ Prototype Mode: AIS positions shown here are synthetic/mock data for demonstration. "
+        "They are not live Marine Cadastre observations."
+    )
 
-        st.write(f"Searching Marine Cadastre AIS Database near spatial origin **X: {rx:.2f}, Y: {ry:.2f}**...")
+    if "real_x" not in st.session_state or "real_y" not in st.session_state:
+        st.warning("Please upload a `.tif` file in Tab 1 first.")
+    else:
+        rx = float(st.session_state["real_x"])
+        ry = float(st.session_state["real_y"])
+        spill_crs = st.session_state.get("crs", "CRS unavailable")
+
+        is_geographic = False
+        try:
+            is_geographic = rasterio.crs.CRS.from_user_input(spill_crs).is_geographic
+        except Exception:
+            pass
+
+        origin_x_label = "Longitude" if is_geographic else "X / Easting"
+        origin_y_label = "Latitude" if is_geographic else "Y / Northing"
+
+        st.markdown("### 📍 Spill Origin")
+        origin_col1, origin_col2, origin_col3 = st.columns(3)
+        with origin_col1:
+            st.metric(origin_x_label, f"{rx:.6f}" if is_geographic else f"{rx:.2f}")
+        with origin_col2:
+            st.metric(origin_y_label, f"{ry:.6f}" if is_geographic else f"{ry:.2f}")
+        with origin_col3:
+            st.metric("CRS", str(spill_crs))
+
+        st.caption("AIS data source: Synthetic / Mock AIS Dataset")
+        screening_radius_km = st.slider(
+            "Screening Radius (km)",
+            min_value=0.5,
+            max_value=20.0,
+            value=5.0,
+            step=0.5,
+            help="Used to mark vessels inside the screening area; all vessels remain ranked.",
+        )
 
         try:
-            ais_df = pd.read_csv("marine_cadastre_ais.csv")
-
-            # Calculate Euclidean distance in meters from detected spill center
-            ais_df['Distance_Meters'] = np.sqrt((ais_df['X'] - rx)**2 + (ais_df['Y'] - ry)**2)
-            
-            # Format distance for UI
-            ais_df['Distance_Formatted'] = ais_df['Distance_Meters'].apply(
-                lambda m: f"{m/1000:.2f} km" if m >= 1000 else f"{int(m)} meters"
+            ais_df = load_ais_data("marine_cadastre_ais.csv")
+            duplicate_count = int(ais_df.attrs.get("duplicate_count", 0))
+            ranked_vessels_df, distance_method, invalid_count = rank_vessels(
+                ais_df,
+                rx,
+                ry,
+                spill_crs,
+                screening_radius_m=screening_radius_km * 1000,
             )
+        except VesselMatcherError as exc:
+            st.error(f"AIS matching unavailable: {exc}")
+        else:
+            if duplicate_count:
+                st.warning(f"Ignored {duplicate_count} duplicate MMSI row(s).")
+            if invalid_count:
+                st.warning(f"Ignored {invalid_count} AIS row(s) with invalid coordinates.")
 
-            # Assign Risk Flag based on distance threshold (< 500m = Prime Suspect)
-            ais_df['Status'] = ais_df['Distance_Meters'].apply(
-                lambda m: "🔴 PRIME SUSPECT" if m < 500 else "🟢 Cleared"
+            closest_vessel = find_closest_vessel(ranked_vessels_df)
+            vessels_in_radius = ranked_vessels_df[
+                ranked_vessels_df["Within_Screening_Radius"]
+            ]
+
+            summary_col1, summary_col2, summary_col3 = st.columns(3)
+            with summary_col1:
+                st.metric("Total Vessels Analyzed", len(ranked_vessels_df))
+            with summary_col2:
+                st.metric(
+                    "Closest Vessel",
+                    str(closest_vessel["VesselName"]) if closest_vessel is not None else "None",
+                )
+            with summary_col3:
+                st.metric(
+                    "Closest Distance",
+                    str(closest_vessel["Distance_Formatted"])
+                    if closest_vessel is not None
+                    else "None",
+                )
+
+            if closest_vessel is not None:
+                st.markdown("### 🚨 Highest-Priority Vessel")
+                if closest_vessel["Status"] == "🔴 PRIME SUSPECT":
+                    st.error(f"{closest_vessel['Status']} — dynamically selected from the dataset")
+                else:
+                    st.warning("Closest vessel is outside the prime-suspect threshold.")
+
+                detail_col1, detail_col2 = st.columns(2)
+                with detail_col1:
+                    st.write(f"**Vessel:** {closest_vessel['VesselName']}")
+                    st.write(f"**MMSI:** {closest_vessel['MMSI']}")
+                    st.write(f"**Type:** {closest_vessel['VesselType']}")
+                with detail_col2:
+                    st.write(f"**Distance from spill origin:** {closest_vessel['Distance_Formatted']}")
+                    st.write(f"**Status:** {closest_vessel['Status']}")
+                    if "Timestamp" in ranked_vessels_df.columns and pd.notna(closest_vessel["Timestamp"]):
+                        st.write(
+                            f"**AIS timestamp:** "
+                            f"{closest_vessel['Timestamp'].strftime('%Y-%m-%d %H:%M UTC')}"
+                        )
+                st.info(
+                    "Proximity is a screening signal only and does not establish vessel responsibility."
+                )
+
+            if vessels_in_radius.empty:
+                st.warning("No vessels detected within the screening radius.")
+            else:
+                st.success(
+                    f"{len(vessels_in_radius)} vessel(s) fall within the "
+                    f"{screening_radius_km:.1f} km screening radius."
+                )
+
+            st.caption(f"Distance method: {distance_method}")
+            st.markdown("### 🚢 Nearby Vessel Analysis")
+            display_df = ranked_vessels_df[
+                [
+                    "Rank",
+                    "VesselName",
+                    "MMSI",
+                    "VesselType",
+                    "Distance_Formatted",
+                    "Status",
+                    "Within_Screening_Radius",
+                ]
+                + (["Timestamp"] if "Timestamp" in ranked_vessels_df.columns else [])
+            ].rename(
+                columns={
+                    "VesselName": "Vessel",
+                    "VesselType": "Type",
+                    "Distance_Formatted": "Distance",
+                    "Within_Screening_Radius": "In Screening Radius",
+                }
             )
-
-            # Display clean result table
-            output_df = ais_df[['VesselName', 'MMSI', 'VesselType', 'Distance_Formatted', 'Status']].rename(
-                columns={'Distance_Formatted': 'Distance to Origin'}
+            if "Timestamp" in display_df.columns:
+                display_df["Timestamp"] = display_df["Timestamp"].map(
+                    lambda value: value.strftime("%Y-%m-%d %H:%M UTC")
+                    if pd.notna(value)
+                    else "Unavailable"
+                )
+            st.dataframe(display_df, hide_index=True, use_container_width=True)
+            st.caption(
+                "Proximity-based matching is a screening mechanism and does not establish vessel responsibility."
             )
-            
-            st.table(output_df.sort_values(by="Distance to Origin"))
-            st.error("🚨 ALERT: **MT ARABIAN STAR (MMSI: 419001234)** identified within 250m of spill origin at timestamp!")
-
-        except FileNotFoundError:
-            st.error("Missing 'marine_cadastre_ais.csv'. Run `python generate_ais.py` first!")
-    else:
-        st.warning("Please upload a `.tif` file in Tab 1 first.")
