@@ -16,11 +16,34 @@ from detection.classifier import (
     EfficientNetOilClassifier,
     runtime_status,
 )
+import importlib
+import tracking.vessel_matcher
+import tracking.suspect_scorer
+
+# Ensure latest module attributes if Streamlit process was already running
+if not hasattr(tracking.vessel_matcher, "load_ais_data_full"):
+    importlib.reload(tracking.vessel_matcher)
+if not hasattr(tracking.suspect_scorer, "build_suspect_ranking"):
+    importlib.reload(tracking.suspect_scorer)
+
 from tracking.vessel_matcher import (
     VesselMatcherError,
     find_closest_vessel,
     load_ais_data,
     rank_vessels,
+)
+
+try:
+    from tracking.vessel_matcher import load_ais_data_full
+except ImportError:
+    def load_ais_data_full(csv_path):
+        return load_ais_data(csv_path, deduplicate=False)
+
+from tracking.suspect_scorer import (
+    build_suspect_ranking,
+    build_incident_result,
+    inspect_ais_capabilities,
+    DEFAULT_WEIGHTS,
 )
 
 
@@ -252,9 +275,10 @@ def build_drift_trajectory(
 
     return pd.DataFrame(trajectory)
 
-st.set_page_config(page_title="Oil Spill Tracker", page_icon="🌊", layout="wide")
 
-st.title("🌊 Maritime Oil Spill Detection & Vessel Tracking System")
+st.set_page_config(page_title="Oil Spill Tracker", page_icon=None, layout="wide")
+
+st.title("Maritime Oil Spill Detection & Vessel Tracking System")
 st.caption("Production GIS Pipeline — Real GeoTIFF Spatial Extraction")
 
 tab1, tab2, tab3 = st.tabs(["1. GeoTIFF Detection", "2. Drift Simulation", "3. Suspect Match"])
@@ -927,7 +951,7 @@ with tab1:
 
                         if centroid_available:
                             st.success(
-                                f"🎯 Spatial centroid extracted! Pixel: ({px}, {py}) | "
+                                f"Spatial centroid extracted! Pixel: ({px}, {py}) | "
                                 f"Coordinates: ({real_x:.2f}, {real_y:.2f}) | CRS: {crs_text}"
                             )
                         else:
@@ -985,7 +1009,222 @@ with tab1:
 import matplotlib.pyplot as plt
 
 with tab2:
+    st.markdown(
+        """
+        <style>
+        /* Single light visual system shared by all three tabs. */
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+
+        :root {
+            --app-bg: #F5F6F7;
+            --card-bg: #FFFFFF;
+            --text: #202124;
+            --muted: #6B7075;
+            --border: #E7E8EA;
+            --accent: #C8FF3D;
+            --control-track: #E2E4E6;
+        }
+
+        html,
+        body,
+        [data-testid="stAppViewContainer"],
+        [data-testid="stHeader"],
+        [data-testid="stMain"],
+        [data-testid="stSidebar"] {
+            background-color: var(--app-bg) !important;
+            color: var(--text) !important;
+        }
+
+        [data-testid="stAppViewContainer"],
+        [data-testid="stAppViewContainer"] *,
+        [data-testid="stSidebar"],
+        [data-testid="stSidebar"] * {
+            font-family: "Inter", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        }
+        /* Preserve Streamlit's icon font; otherwise material icons render as text. */
+        [data-testid="stIconMaterial"],
+        span.material-icons,
+        span.material-symbols-rounded {
+            font-family: "Material Symbols Rounded", "Material Icons", sans-serif !important;
+            font-weight: normal !important;
+            font-style: normal !important;
+            letter-spacing: normal !important;
+            text-transform: none !important;
+        }
+
+        [data-testid="stAppViewContainer"] h1,
+        [data-testid="stAppViewContainer"] h2,
+        [data-testid="stAppViewContainer"] h3,
+        [data-testid="stAppViewContainer"] h4,
+        [data-testid="stHeading"] h1,
+        [data-testid="stHeading"] h2,
+        [data-testid="stHeading"] h3,
+        [data-testid="stHeading"] h4 {
+            color: var(--text) !important;
+            font-weight: 700;
+            letter-spacing: -0.02em;
+        }
+
+        [data-testid="stAppViewContainer"] p,
+        [data-testid="stCaptionContainer"],
+        [data-testid="stCaptionContainer"] *,
+        [data-testid="stWidgetLabel"] * {
+            color: var(--muted) !important;
+        }
+
+        [data-testid="stMarkdownContainer"],
+        [data-testid="stMarkdownContainer"] strong,
+        [data-testid="stMarkdownContainer"] b {
+            color: var(--text);
+        }
+
+        .main .block-container {
+            max-width: 1440px;
+            padding: 2rem 3rem 2.5rem;
+        }
+
+        [data-baseweb="tab-list"] {
+            gap: 0.5rem;
+            border-bottom: 1px solid var(--border);
+        }
+        [data-baseweb="tab"] {
+            color: var(--muted) !important;
+            font-size: 0.875rem;
+            font-weight: 500;
+        }
+        [data-baseweb="tab"][aria-selected="true"] {
+            color: var(--text) !important;
+        }
+        [data-baseweb="tab-highlight"] {
+            background: var(--accent) !important;
+            height: 2px !important;
+        }
+        [data-baseweb="tab-border"] {
+            background: var(--border) !important;
+        }
+        [data-testid="stTab"][role="tab"] {
+            color: var(--muted) !important;
+            font-size: 0.875rem;
+            font-weight: 500;
+        }
+        [data-testid="stTab"][role="tab"][data-selected="true"] {
+            color: var(--text) !important;
+        }
+        [data-testid="stTab"] .react-aria-SelectionIndicator {
+            background: var(--accent) !important;
+            border-color: var(--accent) !important;
+        }
+
+        [data-testid="stVerticalBlockBorderWrapper"] {
+            background: var(--card-bg) !important;
+            border: 1px solid var(--border) !important;
+            border-radius: 18px;
+            box-shadow: 0 4px 16px rgba(32, 33, 36, 0.04);
+        }
+        [data-testid="stMetric"] {
+            background: var(--card-bg) !important;
+            border: 1px solid var(--border) !important;
+            border-radius: 13px;
+            padding: 0.8rem 0.9rem;
+        }
+        [data-testid="stMetricLabel"],
+        [data-testid="stMetricLabel"] * {
+            color: var(--muted) !important;
+            font-size: 0.72rem;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+        }
+        [data-testid="stMetricValue"],
+        [data-testid="stMetricValue"] * {
+            color: var(--text) !important;
+            font-size: 1.35rem;
+            font-weight: 700;
+        }
+        [data-testid="stDataFrame"] {
+            border: 1px solid var(--border);
+            border-radius: 13px;
+            overflow: hidden;
+        }
+
+        [data-testid="stSlider"] label,
+        [data-testid="stSlider"] label * {
+            color: var(--muted) !important;
+        }
+        [data-baseweb="slider"] > div > div {
+            background: var(--control-track) !important;
+        }
+        [data-baseweb="slider"] > div > div > div {
+            background: var(--accent) !important;
+        }
+        [data-baseweb="slider"] [role="slider"] {
+            background: var(--text) !important;
+            border: 2px solid var(--text) !important;
+            box-shadow: 0 0 0 3px var(--accent) !important;
+        }
+        [data-baseweb="slider"] [role="slider"]:focus {
+            box-shadow: 0 0 0 3px var(--accent) !important;
+        }
+
+        [data-testid="stFileUploaderDropzone"],
+        [data-testid="stFileUploader"] section {
+            background: var(--card-bg) !important;
+            border: 1px dashed #D5D8DB !important;
+            border-radius: 13px !important;
+        }
+        [data-testid="stFileUploader"] button {
+            border: 1px solid var(--border) !important;
+            border-radius: 10px !important;
+            color: var(--text) !important;
+            background: var(--card-bg) !important;
+        }
+        [data-testid="stFileUploader"] button,
+        [data-testid="stFileUploader"] button * {
+            color: var(--text) !important;
+        }
+        [data-testid="stFileUploaderDropzoneInstructions"],
+        [data-testid="stFileUploaderDropzoneInstructions"] * {
+            color: var(--muted) !important;
+        }
+
+        [data-testid="stButton"] button[kind="primary"] {
+            background: var(--text) !important;
+            color: #FFFFFF !important;
+            border: 1px solid var(--text) !important;
+            border-radius: 11px !important;
+        }
+        [data-testid="stButton"] button[kind="secondary"],
+        button[kind="secondary"] {
+            background: var(--card-bg) !important;
+            border: 1px solid var(--border) !important;
+            border-radius: 11px !important;
+            color: var(--text) !important;
+        }
+
+        [data-testid="stAlert"] {
+            border-radius: 12px !important;
+            border: 1px solid #DCEAF7 !important;
+            background: #F1F7FF !important;
+        }
+        [data-testid="stAlert"] [data-testid="stMarkdownContainer"],
+        [data-testid="stAlert"] [data-testid="stMarkdownContainer"] * {
+            color: #4B5563 !important;
+        }
+        [data-testid="stExpander"] {
+            background: var(--card-bg) !important;
+            border: 1px solid var(--border) !important;
+            border-radius: 13px !important;
+        }
+        [data-testid="stExpander"] summary,
+        [data-testid="stExpander"] summary * {
+            color: var(--text) !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
     st.subheader("2. Spill Drift Simulation")
+    st.caption("Environmental forcing → cumulative drift trajectory → forecast movement")
 
     if "real_x" in st.session_state and "real_y" in st.session_state:
         rx = float(st.session_state["real_x"])
@@ -1001,12 +1240,28 @@ with tab2:
             spill_crs_obj = None
 
         try:
+            with st.container(border=True):
+                st.markdown("#### Forecast Controls")
+                control_col1, control_col2 = st.columns(2)
+                with control_col1:
+                    hours = st.slider(
+                        "Forecast horizon (hours)",
+                        1,
+                        48,
+                        24,
+                        key="tab2_forecast_horizon",
+                    )
+                with control_col2:
+                    screening_radius_km = st.slider(
+                        "Investigation radius (km)",
+                        0.5,
+                        20.0,
+                        5.0,
+                        0.5,
+                        key="tab2_investigation_radius",
+                    )
+
             ds = xr.open_dataset("ocean_currents.nc")
-
-            st.markdown("### ⏱️ Forecast Timeline")
-            hours = st.slider("Forecast duration (hours)", 1, 48, 24)
-            st.write(f"**Selected forecast:** {hours} hours")
-
             environmental_result = build_environmental_forcing(ds, hours)
             environmental_forcing = environmental_result["forcing"]
             forcing_mode = environmental_result["mode"]
@@ -1026,42 +1281,54 @@ with tab2:
                 )
             )
 
-            st.markdown("### 📍 Spill Origin")
-            origin_col1, origin_col2, origin_col3 = st.columns(3)
-            with origin_col1:
-                if geographic_origin:
-                    st.metric("Longitude", format_geo_coordinate(rx, "E", "W"))
-                else:
-                    origin_units = getattr(spill_crs_obj, "linear_units", "map units")
-                    st.metric("X / Easting", f"{rx:,.2f} {origin_units}")
-            with origin_col2:
-                if geographic_origin:
-                    st.metric("Latitude", format_geo_coordinate(ry, "N", "S"))
-                else:
-                    origin_units = getattr(spill_crs_obj, "linear_units", "map units")
-                    st.metric("Y / Northing", f"{ry:,.2f} {origin_units}")
-            with origin_col3:
-                st.metric("CRS", str(spill_crs))
+            origin_col, environment_col = st.columns(2)
+            with origin_col:
+                with st.container(border=True):
+                    st.markdown("#### Spill Origin")
+                    origin_metric_col1, origin_metric_col2 = st.columns(2)
+                    with origin_metric_col1:
+                        if geographic_origin:
+                            st.metric("Longitude", format_geo_coordinate(rx, "E", "W"))
+                        else:
+                            origin_units = getattr(
+                                spill_crs_obj,
+                                "linear_units",
+                                "map units",
+                            )
+                            st.metric("X / Easting", f"{rx:,.2f} {origin_units}")
+                    with origin_metric_col2:
+                        if geographic_origin:
+                            st.metric("Latitude", format_geo_coordinate(ry, "N", "S"))
+                        else:
+                            origin_units = getattr(
+                                spill_crs_obj,
+                                "linear_units",
+                                "map units",
+                            )
+                            st.metric("Y / Northing", f"{ry:,.2f} {origin_units}")
+                    st.caption(f"CRS: {spill_crs}")
 
-            st.markdown("### 🌊 Environmental Conditions")
-            metric_col1, metric_col2, metric_col3 = st.columns(3)
-            with metric_col1:
-                st.metric(
-                    "🌊 Initial Ocean Current",
-                    f"{u_c:.2f} m/s E | {v_c:.2f} m/s N",
-                )
-            with metric_col2:
-                st.metric(
-                    "💨 Initial Surface Wind",
-                    f"{u_w:.1f} m/s E | {v_w:.1f} m/s N",
-                )
-            with metric_col3:
-                net_speed = math.hypot(net_u, net_v)
-                st.metric("⚡ Initial Combined Drift Speed", f"{net_speed:.2f} m/s")
-            st.caption(
-                "Prototype assumption: combined drift = ocean current + 3% of wind. "
-                f"Forcing mode: {forcing_mode}."
-            )
+            with environment_col:
+                with st.container(border=True):
+                    st.markdown("#### Environmental Conditions")
+                    environment_metric_col1, environment_metric_col2, environment_metric_col3 = st.columns(3)
+                    with environment_metric_col1:
+                        st.metric(
+                            "Ocean Current",
+                            f"{u_c:.2f} m/s E | {v_c:.2f} m/s N",
+                        )
+                    with environment_metric_col2:
+                        st.metric(
+                            "Surface Wind",
+                            f"{u_w:.1f} m/s E | {v_w:.1f} m/s N",
+                        )
+                    with environment_metric_col3:
+                        net_speed = math.hypot(net_u, net_v)
+                        st.metric("Combined Drift", f"{net_speed:.2f} m/s")
+                    st.caption(
+                        "Combined drift = ocean current + 3% of wind. "
+                        f"Forcing mode: {forcing_mode}."
+                    )
 
             trajectory_df = build_drift_trajectory(
                 hours,
@@ -1080,96 +1347,109 @@ with tab2:
                 float(final_point["North_Drift_km"]),
             )
 
-            st.markdown(f"### 📊 {hours}-Hour Forecast")
-            summary_col1, summary_col2, summary_col3 = st.columns(3)
-            with summary_col1:
-                st.metric("Predicted Movement", f"{total_drift_km:.1f} km")
-            with summary_col2:
-                st.metric("Direction", direction)
-            with summary_col3:
-                st.metric("Average Drift Speed", f"{average_drift_speed:.2f} m/s")
+            with st.container(border=True):
+                st.markdown(f"#### {hours}-Hour Forecast")
+                summary_col1, summary_col2, summary_col3, summary_col4 = st.columns(4)
+                with summary_col1:
+                    st.metric("Predicted Movement", f"{total_drift_km:.1f} km")
+                with summary_col2:
+                    st.metric("Direction", direction)
+                with summary_col3:
+                    st.metric("Average Drift Speed", f"{average_drift_speed:.2f} m/s")
+                with summary_col4:
+                    st.metric("Forecast Horizon", f"{hours} h")
 
-            st.info(
-                f"🌊 Predicted spill movement: {total_drift_km:.1f} km over {hours} hours."
-            )
+                st.info(
+                    f"Predicted spill movement: {total_drift_km:.1f} km over {hours} hours."
+                )
 
-            col_left, col_right = st.columns([3, 2])
-            with col_left:
-                st.markdown("### 🗺️ Predicted Spill Movement")
-                fig, ax = plt.subplots(figsize=(7, 5))
-                fig.patch.set_facecolor("#0e1117")
-                ax.set_facecolor("#161b22")
-                ax.plot(
-                    trajectory_df["East_Drift_km"],
-                    trajectory_df["North_Drift_km"],
-                    color="#00d4ff",
-                    linestyle="-",
-                    linewidth=2,
-                    label="Spill Movement",
-                )
-                ax.scatter(
-                    0,
-                    0,
-                    color="#ff4b4b",
-                    s=120,
-                    zorder=5,
-                    label="Spill Start",
-                )
-                ax.scatter(
-                    final_point["East_Drift_km"],
-                    final_point["North_Drift_km"],
-                    color="#ffaa00",
-                    s=120,
-                    zorder=5,
-                    label="Predicted Position",
-                )
-                ax.annotate(
-                    f"+{hours}h — {total_drift_km:.1f} km",
-                    (final_point["East_Drift_km"], final_point["North_Drift_km"]),
-                    textcoords="offset points",
-                    xytext=(10, 10),
-                    ha="left",
-                    color="#ffffff",
-                    fontsize=9,
-                    weight="bold",
-                )
-                ax.set_xlabel("Distance East (km)", color="white")
-                ax.set_ylabel("Distance North (km)", color="white")
-                ax.tick_params(colors="white")
-                ax.margins(0.15)
-                for spine in ax.spines.values():
-                    spine.set_color("#30363d")
-                ax.grid(True, linestyle=":", color="#30363d", alpha=0.6)
-                ax.legend(
-                    facecolor="#0e1117",
-                    edgecolor="#30363d",
-                    labelcolor="white",
-                )
-                st.pyplot(fig)
+                visualization_col, checkpoint_col = st.columns([3, 2])
+                with visualization_col:
+                    st.markdown("##### Predicted Spill Movement")
+                    figure, axis = plt.subplots(figsize=(7, 4.6))
+                    figure.patch.set_facecolor("#FFFFFF")
+                    axis.set_facecolor("#FFFFFF")
+                    axis.plot(
+                        trajectory_df["East_Drift_km"],
+                        trajectory_df["North_Drift_km"],
+                        color="#202124",
+                        linestyle="-",
+                        linewidth=2.2,
+                        label="Spill Movement",
+                    )
+                    axis.scatter(
+                        0,
+                        0,
+                        color="#202124",
+                        edgecolors="#C8FF3D",
+                        linewidths=2,
+                        s=90,
+                        zorder=5,
+                        label="Spill Start",
+                    )
+                    axis.scatter(
+                        final_point["East_Drift_km"],
+                        final_point["North_Drift_km"],
+                        color="#C8FF3D",
+                        edgecolors="#202124",
+                        linewidths=1.4,
+                        s=90,
+                        zorder=5,
+                        label="Predicted Position",
+                    )
+                    axis.annotate(
+                        f"+{hours}h · {total_drift_km:.1f} km",
+                        (final_point["East_Drift_km"], final_point["North_Drift_km"]),
+                        textcoords="offset points",
+                        xytext=(8, 8),
+                        ha="left",
+                        color="#202124",
+                        fontsize=8,
+                        weight="bold",
+                    )
+                    axis.set_xlabel("Distance East (km)", color="#777B80")
+                    axis.set_ylabel("Distance North (km)", color="#777B80")
+                    axis.tick_params(colors="#777B80", labelsize=8)
+                    axis.margins(0.15)
+                    for spine in axis.spines.values():
+                        spine.set_color("#E7E8EA")
+                    axis.grid(True, linestyle="-", color="#E7E8EA", alpha=0.8)
+                    axis.legend(
+                        facecolor="#FFFFFF",
+                        edgecolor="#E7E8EA",
+                        labelcolor="#202124",
+                        frameon=True,
+                        fontsize=8,
+                    )
+                    figure.tight_layout()
+                    st.pyplot(figure, use_container_width=True)
 
-            with col_right:
-                st.markdown("### 📍 Forecast Checkpoints")
-                checkpoint_hours = [
-                    checkpoint for checkpoint in (0, 6, 12, 24, 36, 48)
-                    if checkpoint <= hours
-                ]
-                if hours not in checkpoint_hours:
-                    checkpoint_hours.append(hours)
-                    checkpoint_hours.sort()
-                checkpoint_df = trajectory_df[
-                    trajectory_df["Hour"].isin(checkpoint_hours)
-                ][["Hour", "East_Drift_km", "North_Drift_km", "Total_Drift_km"]].rename(
-                    columns={
-                        "East_Drift_km": "East (km)",
-                        "North_Drift_km": "North (km)",
-                        "Total_Drift_km": "Total Movement (km)",
-                    }
-                )
-                st.dataframe(
-                    checkpoint_df.round(2),
-                    hide_index=True,
-                    use_container_width=True,
-                )
+                with checkpoint_col:
+                    st.markdown("##### Forecast Checkpoints")
+                    checkpoint_hours = [
+                        checkpoint
+                        for checkpoint in (0, 6, 12, 24, 36, 48)
+                        if checkpoint <= hours
+                    ]
+                    if hours not in checkpoint_hours:
+                        checkpoint_hours.append(hours)
+                        checkpoint_hours.sort()
+                    checkpoint_df = trajectory_df[
+                        trajectory_df["Hour"].isin(checkpoint_hours)
+                    ][
+                        ["Hour", "East_Drift_km", "North_Drift_km", "Total_Drift_km"]
+                    ].rename(
+                        columns={
+                            "East_Drift_km": "East (km)",
+                            "North_Drift_km": "North (km)",
+                            "Total_Drift_km": "Total Movement (km)",
+                        }
+                    )
+                    st.dataframe(
+                        checkpoint_df.round(2),
+                        hide_index=True,
+                        use_container_width=True,
+                    )
 
             with st.expander("Detailed Forecast Data"):
                 detailed_df = trajectory_df.rename(
@@ -1197,18 +1477,16 @@ with tab2:
             )
 
         except FileNotFoundError:
-            st.error(
-                "Missing 'ocean_currents.nc'. Run `python generate_metocean.py` first!"
-            )
+            st.error("Missing 'ocean_currents.nc'. Run python generate_metocean.py first!")
         except (KeyError, ValueError, rasterio.errors.RasterioError) as exc:
             st.error(f"Tab 2 could not build the drift forecast: {exc}")
     else:
-        st.warning("Please upload a `.tif` file in Tab 1 first.")
+        st.warning("Please upload a .tif file in Tab 1 first.")
 
 with tab3:
     st.subheader("3. Vessel Tracking & Suspect Matching")
     st.info(
-        "⚠️ Prototype Mode: AIS positions shown here are synthetic/mock data for demonstration. "
+        "Prototype Mode: AIS positions shown here are synthetic/mock data for demonstration. "
         "They are not live Marine Cadastre observations."
     )
 
@@ -1220,15 +1498,17 @@ with tab3:
         spill_crs = st.session_state.get("crs", "CRS unavailable")
 
         is_geographic = False
+        spill_crs_obj = None
         try:
-            is_geographic = rasterio.crs.CRS.from_user_input(spill_crs).is_geographic
+            spill_crs_obj = rasterio.crs.CRS.from_user_input(spill_crs)
+            is_geographic = spill_crs_obj.is_geographic
         except Exception:
             pass
 
         origin_x_label = "Longitude" if is_geographic else "X / Easting"
         origin_y_label = "Latitude" if is_geographic else "Y / Northing"
 
-        st.markdown("### 📍 Spill Origin")
+        st.markdown("### Spill Origin")
         origin_col1, origin_col2, origin_col3 = st.columns(3)
         with origin_col1:
             st.metric(origin_x_label, f"{rx:.6f}" if is_geographic else f"{rx:.2f}")
@@ -1244,11 +1524,12 @@ with tab3:
             max_value=20.0,
             value=5.0,
             step=0.5,
-            help="Used to mark vessels inside the screening area; all vessels remain ranked.",
+            help="Used as the reference scale for distance evidence decay; all vessels remain ranked.",
         )
 
         try:
             ais_df = load_ais_data("marine_cadastre_ais.csv")
+            ais_raw_df = load_ais_data_full("marine_cadastre_ais.csv")
             duplicate_count = int(ais_df.attrs.get("duplicate_count", 0))
             ranked_vessels_df, distance_method, invalid_count = rank_vessels(
                 ais_df,
@@ -1265,20 +1546,55 @@ with tab3:
             if invalid_count:
                 st.warning(f"Ignored {invalid_count} AIS row(s) with invalid coordinates.")
 
-            closest_vessel = find_closest_vessel(ranked_vessels_df)
-            vessels_in_radius = ranked_vessels_df[
-                ranked_vessels_df["Within_Screening_Radius"]
-            ]
+            # --- Determine spill origin in EPSG:4326 for scoring ---
+            if is_geographic:
+                spill_lon, spill_lat = rx, ry
+            elif spill_crs_obj is not None:
+                from rasterio.warp import transform as transform_coordinates_tab3
+                spill_lon_list, spill_lat_list = transform_coordinates_tab3(
+                    spill_crs_obj, "EPSG:4326", [rx], [ry],
+                )
+                spill_lon, spill_lat = spill_lon_list[0], spill_lat_list[0]
+            else:
+                spill_lon, spill_lat = rx, ry
 
-            summary_col1, summary_col2, summary_col3 = st.columns(3)
+            # --- Build multi-factor suspect ranking ---
+            suspect_df = build_suspect_ranking(
+                ranked_vessels_df,
+                ais_raw_df,
+                spill_lat,
+                spill_lon,
+                screening_radius_km,
+            )
+            capabilities = suspect_df.attrs.get(
+                "ais_capabilities",
+                inspect_ais_capabilities(ais_raw_df),
+            )
+
+            # Top-ranked vessel by suspicion score (not distance)
+            top_suspect = suspect_df.iloc[0] if not suspect_df.empty else None
+            # Independently closest vessel by distance
+            closest_vessel = find_closest_vessel(ranked_vessels_df)
+            vessels_in_radius = suspect_df[suspect_df["Within_Screening_Radius"]]
+
+            # ---- Summary Cards ----
+            st.markdown("### Summary")
+            summary_col1, summary_col2, summary_col3, summary_col4 = st.columns(4)
             with summary_col1:
-                st.metric("Total Vessels Analyzed", len(ranked_vessels_df))
+                st.metric("Total Vessels Analyzed", len(suspect_df))
             with summary_col2:
                 st.metric(
-                    "Closest Vessel",
-                    str(closest_vessel["VesselName"]) if closest_vessel is not None else "None",
+                    "Highest-Priority Vessel",
+                    str(top_suspect["VesselName"]) if top_suspect is not None else "None",
                 )
             with summary_col3:
+                st.metric(
+                    "Suspicion Score",
+                    f"{top_suspect['Suspicion_Score']:.1f} / 100"
+                    if top_suspect is not None
+                    else "—",
+                )
+            with summary_col4:
                 st.metric(
                     "Closest Distance",
                     str(closest_vessel["Distance_Formatted"])
@@ -1286,30 +1602,135 @@ with tab3:
                     else "None",
                 )
 
-            if closest_vessel is not None:
-                st.markdown("### 🚨 Highest-Priority Vessel")
-                if closest_vessel["Status"] == "🔴 PRIME SUSPECT":
-                    st.error(f"{closest_vessel['Status']} — dynamically selected from the dataset")
+            # ---- Highest-Priority Vessel Section ----
+            if top_suspect is not None:
+                st.markdown("### Highest-Priority Vessel")
+
+                score_value = float(top_suspect["Suspicion_Score"])
+                if score_value >= 70:
+                    st.error(
+                        f"Investigation Priority: HIGH — "
+                        f"Suspicion Score {score_value:.1f} / 100"
+                    )
+                elif score_value >= 40:
+                    st.warning(
+                        f"Investigation Priority: MODERATE — "
+                        f"Suspicion Score {score_value:.1f} / 100"
+                    )
                 else:
-                    st.warning("Closest vessel is outside the prime-suspect threshold.")
+                    st.info(
+                        f"Investigation Priority: LOW — "
+                        f"Suspicion Score {score_value:.1f} / 100"
+                    )
 
                 detail_col1, detail_col2 = st.columns(2)
                 with detail_col1:
-                    st.write(f"**Vessel:** {closest_vessel['VesselName']}")
-                    st.write(f"**MMSI:** {closest_vessel['MMSI']}")
-                    st.write(f"**Type:** {closest_vessel['VesselType']}")
-                with detail_col2:
-                    st.write(f"**Distance from spill origin:** {closest_vessel['Distance_Formatted']}")
-                    st.write(f"**Status:** {closest_vessel['Status']}")
-                    if "Timestamp" in ranked_vessels_df.columns and pd.notna(closest_vessel["Timestamp"]):
+                    st.write(f"**Vessel:** {top_suspect['VesselName']}")
+                    st.write(f"**MMSI:** {top_suspect['MMSI']}")
+                    st.write(f"**Type:** {top_suspect['VesselType']}")
+                    if "Timestamp" in suspect_df.columns and pd.notna(top_suspect.get("Timestamp")):
                         st.write(
                             f"**AIS timestamp:** "
-                            f"{closest_vessel['Timestamp'].strftime('%Y-%m-%d %H:%M UTC')}"
+                            f"{top_suspect['Timestamp'].strftime('%Y-%m-%d %H:%M UTC')}"
                         )
-                st.info(
-                    "Proximity is a screening signal only and does not establish vessel responsibility."
+                with detail_col2:
+                    st.write(f"**Distance from spill origin:** {top_suspect['Distance_Formatted']}")
+                    if pd.notna(top_suspect.get("Speed_Knots")):
+                        st.write(f"**Speed (SOG):** {top_suspect['Speed_Knots']:.1f} knots")
+                    else:
+                        st.write("**Speed (SOG):** Unavailable")
+                    if top_suspect.get("AIS_Gap_Detected") is not None:
+                        gap_text = "Detected" if top_suspect["AIS_Gap_Detected"] else "No gap detected"
+                        st.write(f"**AIS gap:** {gap_text}")
+                    else:
+                        st.write("**AIS gap:** Not available (single AIS record)")
+                    if pd.notna(top_suspect.get("Trajectory_Evidence")):
+                        traj_level = (
+                            "High" if top_suspect["Trajectory_Evidence"] >= 0.7
+                            else "Moderate" if top_suspect["Trajectory_Evidence"] >= 0.3
+                            else "Low"
+                        )
+                        st.write(f"**Trajectory relationship:** {traj_level}")
+                    else:
+                        st.write("**Trajectory relationship:** Not available (single AIS record)")
+                    vtype_score = top_suspect.get("Vessel_Type_Evidence", 0.5)
+                    vtype_level = (
+                        "High" if vtype_score >= 0.8
+                        else "Moderate" if vtype_score >= 0.5
+                        else "Low"
+                    )
+                    st.write(f"**Vessel type relevance:** {vtype_level}")
+
+                st.caption(
+                    "This score prioritizes vessels for investigation based on available "
+                    "AIS evidence. It does not establish responsibility for the spill."
                 )
 
+                # ---- Evidence Breakdown ----
+                st.markdown("### Suspicion Score Breakdown")
+                breakdown = top_suspect.get("_evidence_breakdown", {})
+                evidence_label_map = {
+                    "distance": "Distance from origin",
+                    "trajectory": "Trajectory relationship",
+                    "speed": "Speed / behaviour",
+                    "ais_gap": "AIS gap",
+                    "vessel_type": "Vessel type",
+                }
+                breakdown_rows = []
+                for signal_key, label in evidence_label_map.items():
+                    component = breakdown.get(signal_key, {})
+                    if component.get("available", False):
+                        score_display = f"{component['score']:.3f}"
+                    else:
+                        score_display = "Not available"
+                    weight_pct = f"{DEFAULT_WEIGHTS.get(signal_key, 0) * 100:.0f}%"
+                    breakdown_rows.append({
+                        "Evidence": label,
+                        "Score": score_display,
+                        "Weight": weight_pct,
+                    })
+                breakdown_rows.append({
+                    "Evidence": "Final Suspicion Score",
+                    "Score": "",
+                    "Weight": f"{score_value:.1f}",
+                })
+                st.dataframe(
+                    pd.DataFrame(breakdown_rows),
+                    hide_index=True,
+                    use_container_width=True,
+                )
+
+                avail_count = sum(
+                    1 for c in breakdown.values() if c.get("available", False)
+                )
+                total_count = len(evidence_label_map)
+                st.caption(f"Evidence available: {avail_count} / {total_count}")
+
+            # ---- Evidence Availability Section ----
+            st.markdown("### Evidence Availability")
+            capability_labels = {
+                "distance": ("AIS geographic distance", capabilities.get("distance", False)),
+                "speed": ("Speed over ground (SOG)", capabilities.get("speed", False)),
+                "vessel_type": ("Vessel type classification", capabilities.get("vessel_type", False)),
+                "trajectory": ("AIS historical trajectory", capabilities.get("trajectory", False)),
+                "ais_gap": ("AIS gap analysis", capabilities.get("ais_gap", False)),
+                "has_timestamp": ("Timestamps", capabilities.get("has_timestamp", False)),
+                "has_course": ("Course / heading", capabilities.get("has_course", False)),
+                "has_multi_record": ("Multiple records per vessel", capabilities.get("has_multi_record", False)),
+            }
+            avail_items = []
+            for cap_key, (cap_label, cap_present) in capability_labels.items():
+                status = "Available" if cap_present else "Unavailable"
+                avail_items.append(f"**{cap_label}:** {status}")
+            st.markdown("  \n".join(avail_items))
+
+            if not capabilities.get("has_multi_record", False):
+                st.caption(
+                    "Trajectory and AIS-gap analysis require multiple AIS records per vessel. "
+                    "The current dataset contains only one position per MMSI."
+                )
+
+            # ---- Screening Radius Summary ----
             if vessels_in_radius.empty:
                 st.warning("No vessels detected within the screening radius.")
             else:
@@ -1319,33 +1740,66 @@ with tab3:
                 )
 
             st.caption(f"Distance method: {distance_method}")
-            st.markdown("### 🚢 Nearby Vessel Analysis")
-            display_df = ranked_vessels_df[
-                [
-                    "Rank",
-                    "VesselName",
-                    "MMSI",
-                    "VesselType",
-                    "Distance_Formatted",
-                    "Status",
-                    "Within_Screening_Radius",
-                ]
-                + (["Timestamp"] if "Timestamp" in ranked_vessels_df.columns else [])
-            ].rename(
-                columns={
-                    "VesselName": "Vessel",
-                    "VesselType": "Type",
-                    "Distance_Formatted": "Distance",
-                    "Within_Screening_Radius": "In Screening Radius",
-                }
-            )
+
+            # ---- Suspect Ranking Table ----
+            st.markdown("### Suspect Ranking")
+
+            # Build display columns dynamically based on what is available
+            display_columns = ["Rank", "VesselName", "MMSI", "VesselType", "Suspicion_Score"]
+            rename_map = {
+                "VesselName": "Vessel",
+                "VesselType": "Type",
+                "Suspicion_Score": "Suspicion Score",
+                "Distance_Formatted": "Distance",
+                "Within_Screening_Radius": "In Screening Radius",
+            }
+            display_columns.append("Distance_Formatted")
+
+            if capabilities.get("speed", False) and "Speed_Knots" in suspect_df.columns:
+                display_columns.append("Speed_Knots")
+                rename_map["Speed_Knots"] = "SOG (knots)"
+
+            display_columns.append("Status")
+
+            if capabilities.get("trajectory", False) and "Trajectory_Evidence" in suspect_df.columns:
+                display_columns.append("Trajectory_Evidence")
+                rename_map["Trajectory_Evidence"] = "Trajectory"
+
+            if capabilities.get("ais_gap", False) and "AIS_Gap_Detected" in suspect_df.columns:
+                display_columns.append("AIS_Gap_Detected")
+                rename_map["AIS_Gap_Detected"] = "AIS Gap"
+
+            display_columns.append("Within_Screening_Radius")
+
+            if "Timestamp" in suspect_df.columns:
+                display_columns.append("Timestamp")
+
+            # Filter to columns that actually exist
+            display_columns = [c for c in display_columns if c in suspect_df.columns]
+            display_df = suspect_df[display_columns].rename(columns=rename_map)
+
+            # Format timestamp for display
             if "Timestamp" in display_df.columns:
                 display_df["Timestamp"] = display_df["Timestamp"].map(
                     lambda value: value.strftime("%Y-%m-%d %H:%M UTC")
                     if pd.notna(value)
                     else "Unavailable"
                 )
+            # Round suspicion score in table
+            if "Suspicion Score" in display_df.columns:
+                display_df["Suspicion Score"] = display_df["Suspicion Score"].map(
+                    lambda v: f"{v:.1f}"
+                )
+            # Round SOG in table
+            if "SOG (knots)" in display_df.columns:
+                display_df["SOG (knots)"] = display_df["SOG (knots)"].map(
+                    lambda v: f"{v:.1f}" if pd.notna(v) else "—"
+                )
+
             st.dataframe(display_df, hide_index=True, use_container_width=True)
+
             st.caption(
-                "Proximity-based matching is a screening mechanism and does not establish vessel responsibility."
+                "Vessels are ranked by multi-factor Suspicion Score, not distance alone. "
+                "This is an evidence-based investigative priority ranking and does not "
+                "establish vessel responsibility."
             )

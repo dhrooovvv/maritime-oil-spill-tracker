@@ -90,9 +90,22 @@ pip install -r requirements.txt
 python generate_metocean.py
 python generate_ais.py
 
-# 4. Launch Streamlit Dashboard
+# 4. Launch the Python API for the React frontend (Terminal 1)
+python backend_api.py
+
+# 5. Launch the React frontend (Terminal 2)
+cd frontend
+npm install
+npm run dev
+
+# 6. Optional: launch the existing Streamlit dashboard (separate UI)
 streamlit run app.py
 ```
+
+The React GeoTIFF workflow runs at `http://127.0.0.1:5173/` and sends the
+selected `.tif`/`.tiff` file to the local API at
+`http://127.0.0.1:8000/api/detect`. The Streamlit dashboard remains available
+separately at its normal port and is not used as the React API.
 
 EfficientNet output is a model score, not a scientifically validated oil
 probability. Reliable oil-spill classification requires fine-tuning and
