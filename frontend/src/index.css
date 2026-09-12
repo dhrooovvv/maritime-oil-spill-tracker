@@ -1,0 +1,92 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+@import "@fontsource-variable/inter";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --font-heading: var(--font-sans);
+  --font-sans: "Inter Variable", "Inter", sans-serif;
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+}
+
+:root {
+  --background: #f5f6f7;
+  --foreground: #202124;
+  --card: #ffffff;
+  --card-foreground: #202124;
+  --popover: #ffffff;
+  --popover-foreground: #202124;
+  --primary: #202124;
+  --primary-foreground: #ffffff;
+  --secondary: #eef0f1;
+  --secondary-foreground: #202124;
+  --muted: #f0f1f2;
+  --muted-foreground: #777b80;
+  --accent: #c8ff3d;
+  --accent-foreground: #202124;
+  --destructive: #b42318;
+  --border: #e7e8ea;
+  --input: #d9dcdf;
+  --ring: #c8ff3d;
+  --chart-1: #202124;
+  --chart-2: #c8ff3d;
+  --chart-3: #777b80;
+  --chart-4: #a8adb2;
+  --chart-5: #d9dcdf;
+  --radius: 0.75rem;
+  color-scheme: light;
+  font-family: "Inter Variable", "Inter", system-ui, sans-serif;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+
+  html {
+    @apply font-sans;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+    margin: 0;
+    min-width: 320px;
+  }
+
+  button,
+  input {
+    font: inherit;
+  }
+}
